@@ -1608,6 +1608,17 @@ def unmapped_aval(axis_size: int, batch_dim: BatchAxis, aval: ShapedArray
     return ShapedArray(tuple(shape), aval.dtype)
 
 
+# -
+
+def xla_call_abstract_eval_rule(*in_types, jaxpr, num_consts):
+  del num_consts  # Unused.
+  jaxpr_type = typecheck_jaxpr(jaxpr)
+  if not all(map(types_equal, jaxpr_type.in_types, in_types)):
+    raise TypeError
+  return jaxpr_type.out_types
+abstract_eval_rules[xla_call_p] = xla_call_abstract_eval_rule
+
+
 # +
 @jit
 def f(x):
@@ -1692,7 +1703,7 @@ print(ydot)
 # In the case of `linearize`, we want to stage out the linear part of a `jvp`
 # computation. That is, if we have `jvp : (a -> b) -> (a, T a) -> (b, T b)`,
 # then we write `linearize : (a -> b) -> a -> (b, T a -o T b)`, where
-# ```
+# ```python
 # y, f_lin = linearize(f, x)
 # y_dot = f_lin(x_dot)
 # ```
@@ -1707,10 +1718,18 @@ print(ydot)
 # we evaluate all the primal values as we trace, but stage the tangent
 # computations into a jaxpr.
 
-def split_half(lst):
-  n, ragged = divmod(len(lst), 2)
-  assert not ragged
+def split_list(lst: List[Any], n: int) -> Tuple[List[Any], List[Any]]:
   return lst[:n], lst[n:]
+
+def split_half(lst: List[Any]) -> Tuple[List[Any], List[Any]]:
+  assert not len(lst) % 2
+  return split_list(lst, len(lst) // 2)
+
+def partition_list(bs: List[bool], l: List[Any]) -> Tuple[List[Any], List[Any]]:
+  lists = lst1, lst2 = [], []
+  for b, x in zip(bs, l):
+    lists[b].append(x)
+  return lst1, lst2
 
 # +
 def linearize_flat(f, *primals_in):
@@ -1721,7 +1740,7 @@ def linearize_flat(f, *primals_in):
     return [*primals_out, *tangents_out]
   jaxpr, pvals_out, consts = partial_eval_flat(f_jvp, pvals_in)
   primal_pvals, _ = split_half(pvals_out)
-  assert all(pval.is_known   for pval in primal_pvals)
+  assert all(pval.is_known for pval in primal_pvals)
   primals_out = [pval.const for pval in primal_pvals]
   f_lin = lambda *tangents: eval_jaxpr(jaxpr, [*consts, *tangents])
   return primals_out, f_lin
@@ -1829,6 +1848,8 @@ class PartialEvalTrace(Trace):
   def process_primitive(self, primitive, tracers, params):
     if all(t.pval.is_known for t in tracers):
       return bind(primitive, *map(full_lower, tracers), **params)
+    rule = partial_eval_rules.get(primitive)
+    if rule: return rule(self, tracers, **params)
     tracers_in = [self.instantiate_const(t) for t in tracers]
     avals_in = [t.aval for t in tracers_in]
     avals_out = abstract_eval_rules[primitive](*avals_in, **params)
@@ -1838,6 +1859,8 @@ class PartialEvalTrace(Trace):
                          map(ref, tracers_out))
     for t in tracers_out: t.recipe = eqn
     return tracers_out
+
+partial_eval_rules = {}
 
 # +
 def tracers_to_jaxpr(tracers_in: List[PartialEvalTracer],
@@ -1933,6 +1956,75 @@ def check_toposort(nodes: List[Any], parents: Callable[[Any], List[Any]]):
 y, sin_lin = linearize(sin, 3.)
 print(y, sin(3.))
 print(sin_lin(1.), cos(3.))
+
+# +
+def xla_call_partial_eval(trace, tracers, *, jaxpr, num_consts):
+  del num_consts  # Unused.
+  in_unknowns = [not t.pval.is_known for t in tracers]
+  jaxpr1, jaxpr2, out_unknowns, num_res = partial_eval_jaxpr(jaxpr, in_unknowns)
+  known_tracers, unknown_tracers = partition_list(in_unknowns, tracers)
+  known_vals = [t.pval.const for t in known_tracers]
+  outs1_res = bind(xla_call_p, *known_vals, jaxpr=jaxpr1, num_consts=0)
+  outs1, res = split_list(outs1_res, len(jaxpr1.outs) - num_res)
+  res_tracers = [trace.instantiate_const(full_raise(trace, x)) for x in res]
+  outs2 = [PartialEvalTracer(trace, PartialVal.unknown(v.aval), None)
+           for v in jaxpr2.outs]
+  eqn = JaxprEqnRecipe(xla_call_p, res_tracers + unknown_tracers,
+                       dict(jaxpr=jaxpr2, num_consts=0),
+                       [v.aval for v in jaxpr2.outs], map(ref, outs2))
+  for t in outs2: t.recipe = eqn
+  outs1, outs2 = iter(outs1), iter(outs2)
+  return [next(outs2) if uk else next(outs1) for uk in out_unknowns]
+partial_eval_rules[xla_call_p] = xla_call_partial_eval
+
+def partial_eval_jaxpr(jaxpr: Jaxpr, in_unknowns: List[bool]
+                       ) -> Tuple[Jaxpr, Jaxpr, List[bool], int]:
+  env: Dict[Var, bool] = {}
+  res = []
+
+  def read(v):
+    if type(v) is Lit: raise NotImplementedError
+    return env[v]
+
+  def write(unk, v):
+    env[v] = unk
+
+  def new_res(v):
+    return res.append(v) or v
+
+  eqns1, eqns2 = [], []
+  map(write, in_unknowns, jaxpr.in_binders)
+  for eqn in jaxpr.eqns:
+    unks = map(read, eqn.inputs)
+    if any(unks):
+      inputs = [v if unk else new_res(v) for unk, v in zip(unks, eqn.inputs)]
+      eqns2.append(JaxprEqn(eqn.primitive, inputs, eqn.params, eqn.out_binders))
+      map(partial(write, True), eqn.out_binders)
+    else:
+      eqns1.append(eqn)
+      map(partial(write, False), eqn.out_binders)
+  out_unknowns = map(read, jaxpr.outs)
+
+  ins1, ins2 = partition_list(in_unknowns, jaxpr.in_binders)
+  outs1, outs2 = partition_list(out_unknowns, jaxpr.outs)
+
+  jaxpr1 = Jaxpr(ins1, eqns1, outs1 + res)
+  jaxpr2 = Jaxpr(res + ins2, eqns2, outs2)
+  return jaxpr1, jaxpr2, out_unknowns, len(res)
+
+
+# +
+@jit
+def f(x):
+  y = sin(x) * 2.
+  z = - y + x
+  return z
+
+y, f_lin = linearize(f, 3.)
+y_dot = f_lin(1.)
+print(y, y_dot)
+# -
+
 # ### `vjp` and `grad`
 #
 # The `vjp` transformatino works a lot like linearize. Its type signature is
@@ -1957,7 +2049,7 @@ def vjp_flat(f, *primals_in):
     return [*primals_out, *tangents_out]
   jaxpr, pvals_out, consts = partial_eval_flat(f_jvp, pvals_in)
   primal_pvals, _ = split_half(pvals_out)
-  assert all(pval.is_known   for pval in primal_pvals)
+  assert all(pval.is_known for pval in primal_pvals)
   primals_out = [pval.const for pval in primal_pvals]
   transpose_inputs = consts + [UndefPrimal(p.aval) for p in tangent_pvals_in]
   f_vjp = lambda *cts: eval_jaxpr_transposed(jaxpr, transpose_inputs, cts)
