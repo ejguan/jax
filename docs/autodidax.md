@@ -2328,7 +2328,7 @@ transpose_rules[mul_p] = mul_transpose_rule
 def neg_transpose_rule(cts, x):
   ybar, = cts
   assert type(x) is UndefPrimal
-  return [ybar]
+  return [neg(ybar)]
 transpose_rules[neg_p] = neg_transpose_rule
 
 def add_transpose_rule(cts, x, y):
